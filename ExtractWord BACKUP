@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import filedialog
+import re
+import os
+import sys
+import subprocess
+import zipfile
+import xml.etree.ElementTree as ET
+from docx import Document
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.text.paragraph import Paragraph
+from docx.table import Table
+from docx.oxml.ns import qn
+from openpyxl import Workbook
+import difflib
+
+# ────────────────────────────────
+# CONTROL FLAGS
+# ────────────────────────────────
+EXTRACT_PARAGRAPHS              = True   # If True, non‑heading paragraphs are output.
+EXTRACT_TABLES                  = True    # If True, tables are extracted.
+ONLY_INCLUDE_HEADINGS_WITH_DATA = True    # Headings only printed when data follows.
+CUSTOM_HEADERS                  = ["Document Info:"]  # Always‑printed custom headers.
+CUSTOM_SECTION_RULES            = {
+    "references": {"Paragraph"}   # In a "References" section, only paragraphs allowed.
+}
+SINGLE_FILE                     = True    # Prompt for a single .docx and open its .xlsx when done.
+MINI_BATCH      = None    # If set to an int and SINGLE_FILE=False, limits files processed in folder mode.
+
+
+# ────────────────────────────────
+# ADDITIONAL FLAGS FOR REFERENCES LOGIC
+# ────────────────────────────────
+
+GET_IN_TEXT_REFERENCES = False    # If True, scan paragraphs/tables for in‑text citations.
+ALWAYS_INCLUDE_LISTS    = True   # Export list items even if EXTRACT_PARAGRAPHS=False
+PRESERVE_BULLETS        = True   # Prepend • or 1. 1.1. etc. on list items
+PRESERVE_BLANK_PARAS    = True   # Keep empty paragraphs as blank rows
+INLINE_MARKUP           = True   # Wrap bold in *...* and italic in _..._
+INDENT_SPACES           = 4      # Spaces per list level
+BULLET_CHAR             = "•"    # Symbol for unordered lists
+
+# ────────────────────────────────
+# UTILITIES – sanitising helpers
+# ────────────────────────────────
+def sanitize_sheet_name(name):
+    """Sanitize an Excel sheet name (≤31 chars, no :\\/*?[])."""
+    name = name.strip() or "Default"
+    return re.sub(r'[:\\/*?\[\]]', "", name)[:31]
+
+def sanitize_filename(filename):
+    """
+    Sanitize a base filename:
+      - Strip whitespace
+      - Replace spaces with underscores
+      - Allow only alphanumerics, underscore, hyphen, period
+      - Strip trailing dots
+    """
+    filename = filename.strip().replace(" ", "_")
+    filename = re.sub(r'[^A-Za-z0-9_.-]', '', filename).rstrip('.')
+    return filename or "Default"
+
+def strip_heading_number(text):
+    """Remove leading numbering (e.g., "4.3 ") from a heading."""
+    return re.sub(r'^\d+(?:\.\d+)*\s*', '', text)
+
+# ────────────────────────────────
+# CITATION LOGIC
+# ────────────────────────────────
+def load_endnotes_map(docx_path):
+    """
+    Load Word endnotes from word/endnotes.xml into a map:
+    { endnote_id: {'text': full_text, 'url': first_url_or_None} }
+    """
+    m = {}
+    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    try:
+        with zipfile.ZipFile(docx_path) as z:
+            data = z.read('word/endnotes.xml')
+        root = ET.fromstring(data)
+        for en in root.findall('w:endnote', ns):
+            eid = en.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id')
+            if eid and eid not in ('-1','0'):
+                txt = "".join(t.text or "" for t in en.findall('.//w:t', ns)).strip()
+                u = re.search(r'https?://\S+', txt)
+                m[int(eid)] = {'text': txt, 'url': u.group(0) if u else None}
+    except Exception:
+        pass
+    return m
+
+def load_manual_refs(doc):
+    """
+    Parse the 'References' section manually, mapping sequential numbers to their entries.
+    """
+    refs = []
+    start = False
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if start:
+            if not t or t.lower().startswith('appendix'):
+                break
+            refs.append(t)
+        elif t.lower() == 'references':
+            start = True
+    mm = {}
+    for i, r in enumerate(refs, 1):
+        u = re.search(r'https?://\S+', r)
+        mm[i] = {'text': r, 'url': u.group(0) if u else None}
+    return mm
+
+def find_citations_in_paragraph(para, end_map, man_map):
+    """
+    Return (primary_ref, [other_refs]) found in a paragraph.
+    """
+    primary, others = None, []
+    # 1) endnoteReference
+    for n in para._p.iter():
+        if n.tag.endswith('}endnoteReference'):
+            rid = int(n.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id'))
+            if rid in end_map:
+                return end_map[rid], []
+    # 2) simple fldSimple
+    for n in para._p.iter():
+        if n.tag.endswith('}fldSimple'):
+            instr = n.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}instr','')
+            if any(kw in instr for kw in ('CITATION','CITE','ADDIN','BIBLIOGRAPHY')):
+                e = {'text': instr.strip(), 'url': None}
+                if not primary: primary = e
+                else:           others.append(e)
+    # 3) complex fields
+    collecting, buf = False, []
+    for n in para._p.iter():
+        if n.tag.endswith('}fldChar') and n.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fldCharType')=='begin':
+            collecting, buf = True, []
+        elif collecting and n.tag.endswith('}instrText'):
+            buf.append(n.text or '')
+        elif collecting and n.tag.endswith('}fldChar') and n.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fldCharType')=='end':
+            collecting = False
+            instr = "".join(buf)
+            if any(kw in instr for kw in ('CITATION','CITE','ADDIN','BIBLIOGRAPHY')):
+                e = {'text': instr.strip(), 'url': None}
+                if not primary: primary = e
+                else:           others.append(e)
+    # 4) superscript bracketed numbers
+    if not primary:
+        nums = []
+        for run in para.runs:
+            if run.font.superscript:
+                nums += re.findall(r'\d+', run.text or '')
+        ids = []
+        for n in nums:
+            nid = int(n)
+            if nid in man_map and nid not in ids:
+                ids.append(nid)
+        if ids:
+            primary = man_map[ids[0]]
+            others  = [man_map[i] for i in ids[1:]]
+    return primary, others
+
+def find_citations_in_table(tbl, end_map, man_map):
+    """
+    Scan table cells for first found refs.
+    """
+    for row in tbl.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                p1, o1 = find_citations_in_paragraph(p, end_map, man_map)
+                if p1:
+                    return p1, o1
+    return None, []
+
+# ────────────────────────────────
+# DOCX WALKERS & TEXT HELPERS
+# ────────────────────────────────
+def iter_block_items(parent):
+    """Yield each Paragraph or Table in document order."""
+    body = parent.element.body if hasattr(parent, "element") else parent
+    for child in body:
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+def get_paragraph_numbering(paragraph, counters):
+    """Return (numbering_string, level) for a numbered list paragraph, or (None, None)."""
+    pPr = paragraph._p.pPr
+    if not pPr or not getattr(pPr, "numPr", None):
+        return None, None
+    numId, ilvl = pPr.numPr.numId, pPr.numPr.ilvl
+    if not numId or not ilvl:
+        return None, None
+    numId_val, lvl = int(numId.val), int(ilvl.val)
+    counters.setdefault(numId_val, [0]*9)
+    ctr = counters[numId_val]
+    ctr[lvl] += 1
+    for deeper in range(lvl+1, 9):
+        ctr[deeper] = 0
+    numbering = ".".join(str(ctr[i]) for i in range(lvl+1) if ctr[i])
+    return numbering, lvl
+
+def is_official_heading(blk):
+    return blk.style and blk.style.name.startswith("Heading")
+
+def is_custom_header(blk, threshold=0.8):
+    txt = blk.text.strip().lower().rstrip(":")
+    for custom in CUSTOM_HEADERS:
+        if difflib.SequenceMatcher(None, txt, custom.lower().rstrip(":")).ratio() >= threshold:
+            return True
+    return False
+
+def runs_with_linebreaks(run):
+    out = []
+    for child in run._r:
+        if child.tag == qn('w:t') and child.text:
+            out.append(child.text)
+        elif child.tag == qn('w:br'):
+            out.append("\n")
+    return "".join(out)
+
+def build_formatted_text(paragraph, counters):
+    num, lvl = get_paragraph_numbering(paragraph, counters)
+    indent = " " * (INDENT_SPACES * (lvl or 0))
+    if num:
+        prefix = f"{num}. "
+    elif PRESERVE_BULLETS and ((paragraph.style and "bullet" in paragraph.style.name.lower()) or lvl is not None):
+        prefix = f"{BULLET_CHAR} "
+    else:
+        prefix = ""
+    pieces = []
+    for run in paragraph.runs:
+        chunk = runs_with_linebreaks(run)
+        if not chunk:
+            continue
+        if INLINE_MARKUP:
+            if run.bold:   chunk = f"*{chunk}*"
+            if run.italic: chunk = f"_{chunk}_"
+        pieces.append(chunk)
+    text = indent + prefix + "".join(pieces).strip()
+    is_list = bool(num) or (paragraph.style and paragraph.style.name.lower().startswith("list"))
+    return text, is_list
+
+def extract_table_as_list(tbl, numbering_counters):
+    table_data = []
+    for row in tbl.rows:
+        row_data = []
+        for cell in row.cells:
+            cell_entries = []
+            for para in cell.paragraphs:
+                txt = para.text
+                num, _ = get_paragraph_numbering(para, numbering_counters)
+                is_list = bool(num) or (para.style and para.style.name.lower().startswith("list"))
+                cell_entries.append((txt, is_list, num))
+            row_data.append(cell_entries)
+        table_data.append(row_data)
+    return table_data
+
+# ────────────────────────────────
+# MAIN PROCESSOR
+# ────────────────────────────────
+def process_document(file_path):
+    """
+    Extract paragraphs and tables from a .docx (with References logic),
+    export to an .xlsx in the same folder, and console-dump everything.
+    """
+    print(f"\n→ Processing: {file_path}")
+    doc = Document(file_path)
+
+    if GET_IN_TEXT_REFERENCES:
+        end_map = load_endnotes_map(file_path)
+        man_map = load_manual_refs(doc)
+    else:
+        end_map = {}
+        man_map = {}
+
+    blocks = list(iter_block_items(doc))
+    numbering_counters = {}
+    default_allowed = set()
+    if EXTRACT_PARAGRAPHS: default_allowed.add("Paragraph")
+    if EXTRACT_TABLES:     default_allowed.add("Table")
+
+    current_rule    = default_allowed.copy()
+    current_section = None
+    pending_header  = None
+    sections        = {}
+    para_ctr        = table_ctr = 1
+
+    for blk in blocks:
+        if isinstance(blk, Paragraph):
+            raw = blk.text
+            txt_stripped = raw.strip()
+
+            # Blank paragraph
+            if txt_stripped == "" and PRESERVE_BLANK_PARAS and current_section:
+                sections[current_section].append({"type":"Blank"})
+                continue
+
+            # Custom header
+            if is_custom_header(blk):
+                current_section = raw.strip()
+                sections.setdefault(current_section, [])
+                current_rule = default_allowed.copy()
+                pending_header = None
+                para_ctr = table_ctr = 1
+                continue
+
+            # Official heading
+            if is_official_heading(blk):
+                num,_ = get_paragraph_numbering(blk, numbering_counters)
+                head  = f"{num} {raw.strip()}" if num else raw.strip()
+                key   = strip_heading_number(raw).lower()
+                if key in CUSTOM_SECTION_RULES:
+                    current_rule = CUSTOM_SECTION_RULES[key]
+                    hp = strip_heading_number(raw)
+                else:
+                    current_rule = default_allowed.copy()
+                    hp = head
+
+                if ONLY_INCLUDE_HEADINGS_WITH_DATA:
+                    pending_header = hp
+                else:
+                    current_section = hp
+                    sections.setdefault(current_section, [])
+                    pending_header = None
+                    para_ctr = table_ctr = 1
+                continue
+
+            # *** HERE: SKIP all normal paragraphs unless either
+            #     - EXTRACT_PARAGRAPHS=True
+            #     - OR we're inside the "References" section ***
+            if not EXTRACT_PARAGRAPHS:
+                if not current_section or strip_heading_number(current_section).strip().lower() != "references":
+                    continue
+
+            # Paragraph or list
+            txt, is_list = build_formatted_text(blk, numbering_counters)
+            allowed_para = ("Paragraph" in current_rule) or (ALWAYS_INCLUDE_LISTS and is_list)
+            if not allowed_para:
+                continue
+
+            # Pending header
+            if ONLY_INCLUDE_HEADINGS_WITH_DATA and pending_header:
+                current_section = pending_header
+                sections.setdefault(current_section, [])
+                pending_header = None
+                para_ctr = table_ctr = 1
+            elif not current_section:
+                current_section = "Default"
+                sections.setdefault(current_section, [])
+                para_ctr = table_ctr = 1
+
+            label = f"[Paragraph{para_ctr}]"
+            if GET_IN_TEXT_REFERENCES:
+                cit_primary, cit_others = find_citations_in_paragraph(blk, end_map, man_map)
+            else:
+                cit_primary, cit_others = None, []
+
+            sections[current_section].append({
+                "type": "Paragraph",
+                "label": label,
+                "content": txt,
+                "cit_primary": cit_primary,
+                "cit_others": cit_others
+            })
+            para_ctr += 1
+
+        else:  # Table
+            if "Table" not in current_rule:
+                continue
+
+            if ONLY_INCLUDE_HEADINGS_WITH_DATA and pending_header:
+                current_section = pending_header
+                sections.setdefault(current_section, [])
+                pending_header = None
+                para_ctr = table_ctr = 1
+            elif not current_section:
+                current_section = "Default"
+                sections.setdefault(current_section, [])
+                para_ctr = table_ctr = 1
+
+            label    = f"[Table{table_ctr}]"
+            tbl_data = extract_table_as_list(blk, numbering_counters)
+            if GET_IN_TEXT_REFERENCES:
+                cit_primary, cit_others = find_citations_in_table(blk, end_map, man_map)
+            else:
+                cit_primary, cit_others = None, []
+
+            sections[current_section].append({
+                "type": "Table",
+                "label": label,
+                "content": tbl_data,
+                "cit_primary": cit_primary,
+                "cit_others": cit_others
+            })
+            table_ctr += 1
+
+    # ────────────────────────────
+    # Export to Excel
+    # ────────────────────────────
+    wb = Workbook()
+    wb.remove(wb.active)
+    for sec, items in sections.items():
+        ws = wb.create_sheet(title=sanitize_sheet_name(sec))
+        r = 1
+        for it in items:
+            if it["type"] == "Blank":
+                r += 1
+                continue
+
+            p = it.get("cit_primary")
+            o = it.get("cit_others", [])
+            ref1 = (p["url"] or p["text"]) if p else None
+            ref2 = "; ".join(x["url"] or x["text"] for x in o) if o else None
+
+            if it["type"] == "Paragraph":
+                ws.cell(r, 1, it["label"])
+                ws.cell(r, 2, it["content"])
+                if ref1: ws.cell(r, 3, ref1)
+                if ref2: ws.cell(r, 4, ref2)
+                r += 1
+
+            else:  # Table
+                first = True
+                for row in it["content"]:
+                    flat = []
+                    for cell_entries in row:
+                        lines = []
+                        for txt, is_list, num in cell_entries:
+                            prefix = ""
+                            if is_list and num:
+                                prefix = f"{num}. "
+                            elif is_list:
+                                prefix = f"{BULLET_CHAR} "
+                            lines.append(prefix + txt)
+                        flat.append("\n".join(lines))
+
+                    if first:
+                        ws.cell(r, 1, it["label"])
+                        for c, val in enumerate(flat, start=2):
+                            ws.cell(r, c, val)
+                        last = 1 + len(flat)
+                        if ref1: ws.cell(r, last+1, ref1)
+                        if ref2: ws.cell(r, last+2, ref2)
+                        first = False
+                    else:
+                        for c, val in enumerate(flat, start=2):
+                            ws.cell(r, c, val)
+                    r += 1
+                r += 1
+
+    out_dir = os.path.dirname(file_path)
+    base    = os.path.splitext(os.path.basename(file_path))[0]
+    safe    = sanitize_filename(base)
+    out_path = os.path.join(out_dir, f"{safe}.xlsx")
+    wb.save(out_path)
+    print(f"   saved → {out_path}")
+
+    # ───────────────────────────────────
+    # Console dump, preserving Word spacing
+    # ───────────────────────────────────
+    print("\n=== Extracted Content ===")
+    for section, items in sections.items():
+        print(f"\n-- Section: {section}")
+        for it in items:
+            if it["type"] == "Blank":
+                print()
+            elif it["type"] == "Paragraph":
+                print(f"{it['label']} {it['content']}")
+                if GET_IN_TEXT_REFERENCES and it.get("cit_primary"):
+                    p = it["cit_primary"]
+                    print(f"    [Ref] {p['url'] or p['text']}")
+                if GET_IN_TEXT_REFERENCES and it.get("cit_others"):
+                    print("    [Other] " + "; ".join(x['url'] or x['text'] for x in it["cit_others"]))
+                print()
+            else:
+                print(f"{it['label']} Table:")
+                for row in it["content"]:
+                    for cell_entries in row:
+                        for txt, is_list, num in cell_entries:
+                            if txt.strip():
+                                prefix = f"{num}. " if is_list and num else (f"{BULLET_CHAR} " if is_list else "")
+                                print(f"    {prefix}{txt}")
+                        print()
+    print("=== End of Content ===\n")
+
+    total_blocks = sum(len(v) for v in sections.values())
+    return sections, total_blocks, out_path
+
+# ────────────────────────────────
+# ENTRY POINT
+# ────────────────────────────────
+def main():
+    root = tk.Tk()
+    root.withdraw()
+
+    if SINGLE_FILE:
+        docx_path = filedialog.askopenfilename(
+            title="Select a Word document",
+            filetypes=[("Word documents", "*.docx")]
+        )
+        if not docx_path:
+            print("No file selected.")
+            return
+        sections, count, xlsx_path = process_document(docx_path)
+        print(f"Finished. Total blocks extracted: {count}\n")
+        try:
+            if os.name == 'nt':
+                os.startfile(xlsx_path)
+            else:
+                opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                subprocess.call([opener, xlsx_path])
+        except Exception as e:
+            print(f"Could not open {xlsx_path}: {e}")
+        return
+
+    # Folder‑mode (unchanged)
+    folder = filedialog.askdirectory(title="Select a Folder Containing Word Documents")
+    if not folder:
+        print("No folder selected.")
+        return
+
+    regex = re.compile(r"^(?P<base>.+?)(?:\s*\((?P<ver>\d+)\))?\.docx$", re.IGNORECASE)
+    groups = {}
+    for fn in os.listdir(folder):
+        if fn.lower().endswith(".docx"):
+            m = regex.match(fn)
+            if not m:
+                continue
+            base = m.group("base").strip().lower()
+            ver  = int(m.group("ver")) if m.group("ver") else 0
+            groups.setdefault(base, []).append((ver, fn))
+
+    total_found        = sum(len(lst) for lst in groups.values())
+    unique_count       = len(groups)
+    duplicates_skipped = total_found - unique_count
+    files_to_process   = {}
+    dup_details        = {}
+
+    for base, lst in groups.items():
+        lst_sorted = sorted(lst, key=lambda x: x[0], reverse=True)
+        chosen     = lst_sorted[0]
+        files_to_process[base] = chosen
+        if len(lst_sorted) > 1:
+            dup_details[base] = {
+                "selected": chosen,
+                "duplicates": lst_sorted[1:]
+            }
+
+     # Apply mini-batch
+    if not SINGLE_FILE and isinstance(MINI_BATCH, int) and MINI_BATCH > 0:
+        items = list(files_to_process.items())[:MINI_BATCH]
+    else:
+        items = list(files_to_process.items())
+
+    processed_files = 0
+    total_blocks    = 0
+    issues          = []
+
+    # Process only the (possibly mini-batched) items
+    for base, (ver, fn) in items:
+        path = os.path.join(folder, fn)
+        try:
+            _, cnt, _ = process_document(path)
+            total_blocks += cnt
+            processed_files += 1
+        except Exception as e:
+            issues.append(f"Error processing {fn}: {e}")
+
+    print("\n===== FINAL REPORT =====")
+    print(f"Total .docx files found:          {total_found}")
+    print(f"Unique files processed:           {unique_count}")
+    print(f"Duplicate/skipped files:          {duplicates_skipped}")
+    if dup_details:
+        print("\nDuplicate groups detail:")
+        for base, info in dup_details.items():
+            sel_ver, sel_fn = info["selected"]
+            dups = ", ".join(f"{fn} (v{v})" for v, fn in info["duplicates"])
+            print(f"  • {base!r}: selected {sel_fn} (v{sel_ver}); skipped [{dups}]")
+    print(f"\nFiles processed successfully:     {processed_files}")
+    print(f"Total blocks extracted:           {total_blocks}")
+    if issues:
+        print("\nIssues encountered:")
+        for issue in issues:
+            print(f"  - {issue}")
+    else:
+        print("\nNo issues encountered.")
+    print("=========================\n")
+
+if __name__ == "__main__":
+    main()

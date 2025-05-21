@@ -19,15 +19,16 @@ import difflib
 # ────────────────────────────────
 # CONTROL FLAGS
 # ────────────────────────────────
-EXTRACT_PARAGRAPHS              = True   # If True, non‑heading paragraphs are output.
+EXTRACT_PARAGRAPHS              = False   # If True, non‑heading paragraphs are output.
 EXTRACT_TABLES                  = True    # If True, tables are extracted.
 ONLY_INCLUDE_HEADINGS_WITH_DATA = True    # Headings only printed when data follows.
 CUSTOM_HEADERS                  = ["Document Info:"]  # Always‑printed custom headers.
 CUSTOM_SECTION_RULES            = {
-    "references": {"Paragraph"}   # In a "References" section, only paragraphs allowed.
+    "references": {"Paragraph"}   # Custom section enables override of control flag rules; extracts paragraphs for this section even when EXTRACT_PARAGRAPHS=False
 }
 SINGLE_FILE                     = True    # Prompt for a single .docx and open its .xlsx when done.
 MINI_BATCH      = None    # If set to an int and SINGLE_FILE=False, limits files processed in folder mode.
+ADD_START_TAGS = False  # If True, inserts [Start] marker in Column B for tables
 
 
 # ────────────────────────────────
@@ -326,17 +327,11 @@ def process_document(file_path):
                     para_ctr = table_ctr = 1
                 continue
 
-            # *** HERE: SKIP all normal paragraphs unless either
-            #     - EXTRACT_PARAGRAPHS=True
-            #     - OR we're inside the "References" section ***
-            if not EXTRACT_PARAGRAPHS:
-                if not current_section or strip_heading_number(current_section).strip().lower() != "references":
-                    continue
 
             # Paragraph or list
             txt, is_list = build_formatted_text(blk, numbering_counters)
-            allowed_para = ("Paragraph" in current_rule) or (ALWAYS_INCLUDE_LISTS and is_list)
-            if not allowed_para:
+            # Only extract paragraphs if allowed by the current section rules
+            if "Paragraph" not in current_rule:
                 continue
 
             # Pending header
@@ -395,7 +390,7 @@ def process_document(file_path):
             })
             table_ctr += 1
 
-    # ────────────────────────────
+        # ────────────────────────────
     # Export to Excel
     # ────────────────────────────
     wb = Workbook()
@@ -414,6 +409,7 @@ def process_document(file_path):
             ref2 = "; ".join(x["url"] or x["text"] for x in o) if o else None
 
             if it["type"] == "Paragraph":
+                # Paragraphs unchanged
                 ws.cell(r, 1, it["label"])
                 ws.cell(r, 2, it["content"])
                 if ref1: ws.cell(r, 3, ref1)
@@ -421,31 +417,47 @@ def process_document(file_path):
                 r += 1
 
             else:  # Table
-                first = True
+                # Flatten each table row and identify the row with the most columns as the start row
+                flat_rows = []
                 for row in it["content"]:
                     flat = []
                     for cell_entries in row:
                         lines = []
                         for txt, is_list, num in cell_entries:
-                            prefix = ""
-                            if is_list and num:
-                                prefix = f"{num}. "
-                            elif is_list:
-                                prefix = f"{BULLET_CHAR} "
+                            prefix = f"{num}. " if is_list and num else (BULLET_CHAR + " " if is_list else "")
                             lines.append(prefix + txt)
                         flat.append("\n".join(lines))
-
-                    if first:
+                    flat_rows.append(flat)
+                # Determine the row with the highest number of unique non-empty cells
+                if flat_rows:
+                    unique_counts = []
+                    for rw in flat_rows:
+                        non_empty = [cell.strip() for cell in rw if cell.strip()]
+                        unique_counts.append(len(set(non_empty)))
+                    # pick the first row with the maximum unique count
+                    start_idx = unique_counts.index(max(unique_counts))
+                else:
+                    start_idx = 0
+                # Export rows
+                col_offset = 2 if ADD_START_TAGS else 1
+                start_col = 3 if ADD_START_TAGS else 2
+                for idx, flat in enumerate(flat_rows):
+                    # Write table label on the first row
+                    if idx == 0:
                         ws.cell(r, 1, it["label"])
-                        for c, val in enumerate(flat, start=2):
-                            ws.cell(r, c, val)
-                        last = 1 + len(flat)
-                        if ref1: ws.cell(r, last+1, ref1)
-                        if ref2: ws.cell(r, last+2, ref2)
-                        first = False
-                    else:
-                        for c, val in enumerate(flat, start=2):
-                            ws.cell(r, c, val)
+                    # Write start tag if enabled and on the row with the most columns
+                    if ADD_START_TAGS and idx == start_idx:
+                        ws.cell(r, 2, "[Start]")
+                    # Write row data starting at column C or B depending on ADD_START_TAGS
+                    for c, val in enumerate(flat, start=start_col):
+                        ws.cell(r, c, val)
+                    # Include citations on the start row
+                    if idx == start_idx:
+                        last_col = col_offset + len(flat)
+                        if ref1:
+                            ws.cell(r, last_col+1, ref1)
+                        if ref2:
+                            ws.cell(r, last_col+2, ref2)
                     r += 1
                 r += 1
 
@@ -506,12 +518,14 @@ def main():
         print(f"Finished. Total blocks extracted: {count}\n")
         try:
             if os.name == 'nt':
+                os.startfile(docx_path)
                 os.startfile(xlsx_path)
             else:
                 opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                subprocess.call([opener, docx_path])
                 subprocess.call([opener, xlsx_path])
         except Exception as e:
-            print(f"Could not open {xlsx_path}: {e}")
+            print(f"Could not open files: {e}")
         return
 
     # Folder‑mode (unchanged)

@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+import os, sys, json, subprocess, re
+from difflib import SequenceMatcher
+from docx import Document
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
+from openpyxl.styles import Border, Side, Alignment
+from openpyxl import load_workbook
+
+# ——— CONFIGURATION —————————————————————————————————————
+USE_DEFAULT = False
+DEFAULT_PATH = "/Users/coding/.../FinalA_PSER_..._CONVERTED.docx"
+SINGLE_FILE = False
+BATCH_SIZE = None
+SKIP_COMPLETED = True        # ← make sure this is True
+MAPPING_FILE = "column_mappings.json"
+MAPPING_SIMILARITY_THRESHOLD = 0.6
+AUTO_ASSIGN_THRESHOLD = 0.8   # auto‐map if best score ≥ this
+
+FINAL_COLUMNS = [
+    "Formulation ref no.",
+    "Raw Material TDS Item Code",
+    "TDS / Raw Material Name",
+    "Trade Name",
+    "Function",
+    "Supplier (Name & Location)",
+    "Manufacturer (name and location)",
+    "Material Name / Subcomponents",
+    "Function of Subcomponents in Final Formula",
+    "CAS #",
+    "EC # or KE# (EU and Korea respectively)",
+    "MSDS Date (<3 years)",
+    "CoA Date (<3 years respectively)",
+    "RMQ(<5  years)",
+    "Impurities",
+    "FIS Date (< 3 year)",
+    "TDS# A Concentration of the raw materials in finished product %",
+    "TDS# A Concentration of the subcomponents in the raw materials %",
+    "TDS# A Concentration of the subcomponents in the finished product %",
+    "Post reaction: wt% in finished product (if applicable, delete this column if there is no reaction)",
+    "Nanomaterial (Y/N - if yes, in which country/regional definition and classification)",
+    "Regulatory Comments",
+    "Compliance to inventory lists"
+]
+
+def clean_text(txt: str) -> str:
+    s = re.sub(r'\s+', ' ', txt.replace('\n',' ').replace('\t',' ')).strip()
+    tokens = s.split(' ')
+    vocab = {
+        t
+        for col in FINAL_COLUMNS
+        for t in re.sub(r'[^a-z0-9 ]+', ' ', col.lower()).split()
+    }
+    i = 0
+    while i < len(tokens)-1:
+        joint = (tokens[i] + tokens[i+1]).lower()
+        if joint in vocab:
+            tokens[i] += tokens[i+1]
+            del tokens[i+1]
+        else:
+            i += 1
+    return ' '.join(tokens).strip()
+
+def normalize(txt: str) -> str:
+    t = re.sub(r'[^a-z0-9 ]+', ' ', txt.lower())
+    return re.sub(r'\s+', ' ', t).strip()
+
+def similarity(a: str, b: str) -> float:
+    na, nb = normalize(a), normalize(b)
+    seq = SequenceMatcher(None, na, nb).ratio()
+    sa, sb = set(na.split()), set(nb.split())
+    tok = len(sa & sb) / len(sa | sb) if sa and sb else 0
+    return max(seq, tok)
+
+def find_best_header_row(table):
+    best_idx = None; best_texts = None; max_count = 0
+    for idx, row in enumerate(table.rows):
+        texts = [clean_text(c.text) for c in row.cells]
+        non_empty = [t for t in texts if t]
+        if not non_empty or len(non_empty) != len(set(non_empty)):
+            continue
+        if len(non_empty) > max_count:
+            max_count, best_idx, best_texts = len(non_empty), idx, texts
+    return (best_texts, best_idx) if best_idx is not None else (None, None)
+
+def table_to_dataframe(table):
+    mc = max(len(r.cells) for r in table.rows)
+    data = []
+    for row in table.rows:
+        cells = [clean_text(c.text) for c in row.cells]
+        cells += [""] * (mc - len(cells))
+        data.append(cells)
+    return pd.DataFrame(data)
+
+def trim_table_end(df, window=3, threshold=0.5):
+    ncols = df.shape[1]
+    cut = ncols * threshold
+    counts = df.astype(bool).sum(axis=1)
+    for i in range(len(df) - window + 1):
+        if all(counts.iloc[i+j] < cut for j in range(window)):
+            return df.iloc[:i].copy()
+    return df
+
+def prompt_header(header):
+    sims = [(fc, similarity(header, fc)) for fc in FINAL_COLUMNS]
+    best_fc, best_score = max(sims, key=lambda x: x[1])
+    if best_score >= AUTO_ASSIGN_THRESHOLD:
+        print(f"Auto‐assigned '{header}' → '{best_fc}' (score {best_score:.2f})")
+        return best_fc, False
+    print(f"\nUnable to auto‐map → '{header}' (best={best_fc} @ {best_score:.2f})")
+    print("  [Enter/Y to accept suggestion]  OR  choose a number, OR 'U' to undo last")
+    for i, (fc, score) in enumerate(sims, 1):
+        mark = "*" if fc == best_fc else " "
+        print(f"{i:2d}.{mark} {fc} ({score:.2f})")
+    print("  0. [leave unmapped]")
+    while True:
+        choice = input("Choice (Y/number/U): ").strip().lower()
+        if choice in ("", "y"):
+            return best_fc, True
+        if choice == "u":
+            return "UNDO", True
+        if choice.isdigit():
+            ci = int(choice)
+            if ci == 0:
+                return "", True
+            if 1 <= ci <= len(FINAL_COLUMNS):
+                return FINAL_COLUMNS[ci-1], True
+        print("Invalid—press Enter/Y, 'U', or type 0–23.")
+
+def load_mappings():
+    return json.load(open(MAPPING_FILE)) if os.path.exists(MAPPING_FILE) else {}
+
+def save_mappings(mapping):
+    with open(MAPPING_FILE, "w") as f:
+        json.dump(mapping, f, indent=2, sort_keys=True)
+
+def apply_styles(wb):
+    thin   = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align  = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.border    = border
+                cell.alignment = align
+
+def process_docx(path):
+    print(f"\nProcessing '{path}'")
+    doc    = Document(path)
+    tables, hdrs = {}, {}
+
+    for i, tbl in enumerate(doc.tables, 1):
+        headers, hidx = find_best_header_row(tbl)
+        if not headers:
+            continue
+        df_raw = table_to_dataframe(tbl)
+        body   = df_raw.iloc[hidx+1:].reset_index(drop=True)
+        body   = trim_table_end(body)
+        body.columns = headers + [""]*(body.shape[1] - len(headers))
+        tables[i], hdrs[i] = body, headers
+
+    if not tables:
+        print(" No valid tables found.")
+        return None
+
+    scores = []
+    for idx, h in hdrs.items():
+        sims = [max(similarity(fc, hh) for hh in h if hh) for fc in FINAL_COLUMNS]
+        avg  = sum(sims)/len(sims) if sims else 0
+        scores.append((idx, avg))
+        print(f" Table {idx}: avg sim = {avg:.2f}")
+    best_avg = max(avg for _, avg in scores)
+    tops     = [i for i,avg in scores if avg==best_avg and avg>=MAPPING_SIMILARITY_THRESHOLD]
+    print(f" Top‐matched tables: {tops} (score {best_avg:.2f})")
+    if not tops:
+        return None
+
+    mapping     = load_mappings()
+    map_history = []
+    all_hdrs    = list(dict.fromkeys(sum((hdrs[i] for i in tops), [])))
+
+    i = 0
+    while i < len(all_hdrs):
+        hdr = all_hdrs[i]
+        if not hdr:
+            i += 1; continue
+
+        if hdr not in mapping:
+            best_existing, best_score = None, 0
+            for k in mapping:
+                sc = similarity(hdr, k)
+                if sc > best_score:
+                    best_existing, best_score = k, sc
+            if best_score >= AUTO_ASSIGN_THRESHOLD:
+                print(f"Reusing '{best_existing}'→'{mapping[best_existing]}' for '{hdr}' (score {best_score:.2f})")
+                mapping[hdr] = mapping[best_existing]
+                save_mappings(mapping)
+                i += 1; continue
+            mapped, record = prompt_header(hdr)
+            if mapped == "UNDO":
+                if not map_history:
+                    print("Nothing to undo."); continue
+                last = map_history.pop()
+                del mapping[last]
+                print(f"Undid mapping for '{last}'")
+                i = all_hdrs.index(last); continue
+            mapping[hdr] = mapped
+            if record:
+                map_history.append(hdr)
+            save_mappings(mapping)
+        i += 1
+
+    out_dir = os.path.dirname(path)
+    base    = os.path.splitext(os.path.basename(path))[0]
+    out     = os.path.join(out_dir, f"{base}_extracted.xlsx")
+
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        for idx, df in tables.items():
+            df.to_excel(writer, sheet_name=f"Table{idx}"[:31], index=False)
+        for idx in tops:
+            df = tables[idx]
+            mapped_df = pd.DataFrame({fc:"" for fc in FINAL_COLUMNS}, index=df.index)
+            for hdr, fc in mapping.items():
+                if fc and hdr in df.columns:
+                    mapped_df[fc] = df[hdr]
+            mapped_df.to_excel(writer, sheet_name=f"Mapped{idx}"[:31], index=False)
+
+    wb = load_workbook(out)
+    apply_styles(wb)
+    wb.save(out)
+    print(f" Saved → {out}")
+    return out
+
+def main():
+    if USE_DEFAULT and os.path.exists(DEFAULT_PATH):
+        if os.path.isdir(DEFAULT_PATH):
+            docs = [os.path.join(DEFAULT_PATH, f)
+                    for f in os.listdir(DEFAULT_PATH)
+                    if f.lower().endswith(".docx")]
+        else:
+            docs = [DEFAULT_PATH]
+    else:
+        tk.Tk().withdraw()
+        if SINGLE_FILE:
+            sel = filedialog.askopenfilename(
+                title="Select Word file", filetypes=[("DOCX","*.docx")])
+            docs = [sel] if sel else []
+        else:
+            fld = filedialog.askdirectory(title="Select folder")
+            docs = ([os.path.join(fld, f)
+                     for f in os.listdir(fld)
+                     if f.lower().endswith(".docx")] if fld else [])
+
+    if not docs:
+        print("No documents to process.")
+        return
+
+    # — skip completed files —
+    if SKIP_COMPLETED:
+        before = len(docs)
+        kept   = []
+        for d in docs:
+            base = os.path.splitext(os.path.basename(d))[0]
+            out  = os.path.join(os.path.dirname(d), f"{base}_extracted.xlsx")
+            if os.path.exists(out):
+                print(f"· skipping already‐processed: {os.path.basename(d)}")
+            else:
+                kept.append(d)
+        docs    = kept
+        skipped = before - len(docs)
+        print(f"SKIP_COMPLETED → skipped {skipped} file(s)\n")
+
+    if not SINGLE_FILE:
+        docs = docs[:BATCH_SIZE]
+
+    results = []
+    total   = len(docs)
+    for idx, doc in enumerate(docs, start=1):
+        print(f"[{idx}/{total}] Processing {os.path.basename(doc)}")
+        xlsx = process_docx(doc)
+        if xlsx:
+            results.append((doc, xlsx))
+
+    if len(results) == 1:
+        doc, xlsx = results[0]
+        opener = "open" if sys.platform=="darwin" else "xdg-open"
+        if sys.platform.startswith("win"):
+            os.startfile(doc); os.startfile(xlsx)
+        else:
+            subprocess.call([opener, doc]); subprocess.call([opener, xlsx])
+    elif results:
+        folder = os.path.dirname(results[0][1])
+        opener = "open" if sys.platform=="darwin" else "xdg-open"
+        subprocess.call([opener, folder])
+
+if __name__=="__main__":
+    main()

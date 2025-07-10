@@ -1,0 +1,172 @@
+from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+import re
+import os
+
+# ───────────────────────────────
+# USER CONTROLS
+# ───────────────────────────────
+RECORDS_PER_PAGE_LIMIT = 2  # Set to None to process all records per page
+
+# ───────────────────────────────
+# Functions
+# ───────────────────────────────
+def parse_fields(fields_text):
+    fields_text = re.sub(r'^\d+%?\d*%?Approved', '', fields_text).strip()
+    date_match = re.search(r'\d{2}/\d{2}/\d{4}', fields_text)
+    date = date_match.group(0) if date_match else 'Not found'
+    remaining = fields_text.replace(date, '', 1).strip() if date_match else fields_text
+    cas_matches = re.findall(r'\d{2,7}-\d{2}-\d', remaining)
+    for cas in cas_matches:
+        remaining = remaining.replace(cas, '', 1).strip()
+    ec_matches = re.findall(r'\d{3}-\d{3}-\d', remaining)
+    for ec in ec_matches:
+        remaining = remaining.replace(ec, '', 1).strip()
+    names = remaining.split()
+    name = names[0] if names else 'Not found'
+    common_trade = names[1] if len(names) > 1 else 'Not found'
+    return {
+        "Next periodic Review": date,
+        "Name": name,
+        "Common/TradeName": common_trade,
+        "CAS Number(s)": cas_matches,
+        "EC Number(s)": ec_matches
+    }
+
+TEMP_HTML_FILE = "current_record_temp.html"
+
+def process_current_page(page):
+    html_content = page.content()
+    soup = BeautifulSoup(html_content, "html.parser")
+    divs = soup.find_all("div", attrs={"data-recordid": True})
+
+    if not divs:
+        print("No records found on this page. Ending script.")
+        return False
+
+    records = {}
+    record_first_inner_ids = {}
+    for div in divs:
+        record_id = div["data-recordid"]
+        inner_div = div.find("div", class_="x-body-el x-gridcell-body-el")
+        inner_id = inner_div.get("id") if inner_div and inner_div.get_text(strip=True) else None
+        text = div.get_text(strip=True)
+        if text:
+            if record_id not in records:
+                records[record_id] = []
+                record_first_inner_ids[record_id] = inner_id
+            records[record_id].append(text)
+
+    count = 0
+    for rid, fields in records.items():
+        if RECORDS_PER_PAGE_LIMIT and count >= RECORDS_PER_PAGE_LIMIT:
+            print(f"Reached RECORDS_PER_PAGE_LIMIT of {RECORDS_PER_PAGE_LIMIT}. Moving to next page.")
+            break
+
+        full_text = " ".join(fields).strip()
+        if full_text:
+            parsed = parse_fields(full_text)
+            print(f"\nRecord ID: {rid}")
+            print(f"Next periodic Review: {parsed['Next periodic Review']}")
+            print(f"Name: {parsed['Name']}")
+            print(f"Common/TradeName: {parsed['Common/TradeName']}")
+            print(f"CAS Number(s): {', '.join(parsed['CAS Number(s)']) if parsed['CAS Number(s)'] else 'Not found'}")
+            print(f"EC Number(s): {', '.join(parsed['EC Number(s)']) if parsed['EC Number(s)'] else 'Not found'}")
+            print(f"First Inner Div ID: {record_first_inner_ids[rid] if record_first_inner_ids[rid] else 'Not found'}")
+
+            element_id = record_first_inner_ids[rid]
+            if element_id:
+                try:
+                    page.dblclick(f"#{element_id}")
+                    print(f"Double-clicked element with ID: {element_id}")
+                    page.wait_for_timeout(2000)
+
+                    # Save updated HTML to TEMP file (overwritten each time)
+                    new_html = page.content()
+                    with open(TEMP_HTML_FILE, "w", encoding="utf-8") as f:
+                        f.write(new_html)
+                    print(f"Saved temporary HTML to {TEMP_HTML_FILE}")
+
+                    # Extract ProfileID using Playwright live evaluation
+                    try:
+                        profile_input_selector = "input[name='doc.ingredient_profile_id']"
+                        profile_input_element = page.query_selector(profile_input_selector)
+                        if profile_input_element:
+                            profile_value = profile_input_element.input_value().strip()
+                            print(f"ProfileID: {profile_value if profile_value else '(blank)'}")
+                        else:
+                            print("ProfileID input field not found.")
+                    except Exception as e:
+                        print(f"Error retrieving ProfileID via Playwright: {e}")
+
+                    # Close the record using dynamic close button detection
+                    button = BeautifulSoup(new_html, "html.parser").find("button", {
+                        "type": "button",
+                        "data-componentid": re.compile(r"^ext-cancelButton", re.IGNORECASE)
+                    })
+                    if button:
+                        close_button_id = button.get("id")
+                        print(f"Detected close button ID: {close_button_id}")
+                        page.click(f"#{close_button_id}")
+                        print(f"Clicked close button with ID: {close_button_id}")
+                        page.wait_for_timeout(2000)
+                    else:
+                        print("Close button not found.")
+
+                except Exception as e:
+                    print(f"Error processing record {rid}: {e}")
+        count += 1
+
+    return True
+
+# ───────────────────────────────
+# Main Playwright script
+# ───────────────────────────────
+with sync_playwright() as p:
+    browser = p.chromium.launch_persistent_context(user_data_dir="./playwright_profile", headless=False)
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    page.goto("https://reckitt.cara.cloud/cara/#home/gsa/gsa_pic_subcomponents")
+    page.wait_for_load_state("networkidle")
+    print("Page loaded. Starting automated extraction with automatic pagination...")
+
+    page_counter = 1
+    next_button_selector = "#ext-element-2155"
+
+    while True:
+        print(f"\n=== Processing Page {page_counter} ===")
+        records_found = process_current_page(page)
+        if not records_found:
+            break
+
+        # Pagination: click the Next button automatically
+        next_button = page.query_selector(next_button_selector)
+        if next_button:
+            is_enabled = next_button.is_enabled()
+            if is_enabled:
+                try:
+                    next_button.click()
+                    print(f"Clicked Next button to go to page {page_counter + 1}.")
+                    page_counter += 1
+                    page.wait_for_timeout(3000)
+                except Exception as e1:
+                    print(f"Click failed: {e1}. Trying JS click fallback...")
+                    try:
+                        page.evaluate(f"document.querySelector('{next_button_selector}').click()")
+                        print(f"Clicked Next button using JavaScript to go to page {page_counter + 1}.")
+                        page_counter += 1
+                        page.wait_for_timeout(3000)
+                    except Exception as e2:
+                        print(f"JS click failed: {e2}. Ending pagination.")
+                        break
+            else:
+                print("Next button found but is disabled. Reached last page. Ending script.")
+                break
+        else:
+            print("Next button not found. Ending pagination.")
+            break
+
+    if os.path.exists(TEMP_HTML_FILE):
+        os.remove(TEMP_HTML_FILE)
+        print(f"Deleted temporary HTML file: {TEMP_HTML_FILE}")
+
+    print(f"\nAll records processed across {page_counter} pages. Script finished (browser remains open).")
